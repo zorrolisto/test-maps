@@ -22,6 +22,22 @@ from ortools.linear_solver import pywraplp
 
 # ----- Funciones -----
 
+def tsp_distance(cluster):
+    coords = cluster['packages'][['lat', 'lon']].values
+    if len(coords) < 2:
+        return 0
+    current = coords[0]
+    remaining = list(coords[1:])
+    distance = 0
+    while remaining:
+        next_point = min(remaining, key=lambda p: np.linalg.norm(current - p))
+        distance += np.linalg.norm(current - next_point)
+        current = next_point
+        remaining.remove(next_point)
+    # Volver al punto de inicio
+    distance += np.linalg.norm(current - coords[0])
+    return distance
+
 def obtener_grafo_miraflores(place_name="Miraflores, Lima, Peru", graphml_file="miraflores_network.graphml"):
     # Verificar si el archivo GraphML ya existe
     # TODO: verificar que tan reciente es el archivo (MAX_AGE = 1 mes)
@@ -36,7 +52,6 @@ def obtener_grafo_miraflores(place_name="Miraflores, Lima, Peru", graphml_file="
         ox.save_graphml(graph, filepath=graphml_file)
         print(f"Grafo guardado en {graphml_file}")
 
-    print("Grafo listo para usar.")
     return graph
 
 def visualizar_grafo(grafo):
@@ -67,11 +82,6 @@ def obtener_paquetes_con_coordenadas():
     ]
     # ahora solo obtener en este df el "PESO BALANZA", "PESO VOLUMEN" y "GUIA"
     filtered_df = filtered_df[["PESO BALANZA", "PESO VOLUMEN", "GUIA"]]
-    #print primeros 10
-    print("Primeros 10 paquetes:")
-    print(filtered_df.head(10))
-
-
 
     paquetes_coordinadas_only = []
 
@@ -118,8 +128,9 @@ def assign_to_trucks(clusters, trucks):
                 assignments.append({
                     'truck_id': truck['id'],
                     'cluster': cluster,
-                    'remaining_weight': truck['max_weight'] - cluster['total_weight'],
-                    'remaining_volume': truck['max_volume'] - cluster['total_volume']
+                    'remaining_weight': float(truck['max_weight']) - float(cluster['total_weight']),
+                    'remaining_volume': float(truck['max_volume']) - float(cluster['total_volume']),
+                    'truck': truck
                 })
                 remaining_clusters.remove(cluster)
                 break
@@ -271,6 +282,10 @@ def bin_packing_split(cluster: pd.DataFrame, truck: Dict):
     
     # Resolver
     status = solver.Solve()
+
+    if status != pywraplp.Solver.OPTIMAL and status != pywraplp.Solver.FEASIBLE:
+        raise Exception("No se encontró una solución válida para el bin packing")
+
     
     # Recuperar clusters
     clusters = []
@@ -307,7 +322,9 @@ def optimize_residual_space(assignments: List[Dict], trucks: List[Dict]):
                             assignment['cluster']['packages'],
                             candidate['cluster']['packages']
                         ])
+                        assignment['cluster']['total_weight'] += candidate['cluster']['total_weight']
                         assignment['remaining_weight'] -= candidate['cluster']['total_weight']
+                        assignment['cluster']['total_volume'] += candidate['cluster']['total_volume']
                         assignment['remaining_volume'] -= candidate['cluster']['total_volume']
                         assignments.remove(candidate)
                         break
@@ -375,6 +392,7 @@ def asignaciones_de_paquetes_a_grupos(packages, trucks):
     # Generar asignación óptima
     assignments = multi_capacity_clustering(packages, trucks)
     
+    print("")
     # Mostrar resultados
     if assignments:
         print("Asignación de camiones:")
@@ -384,8 +402,8 @@ def asignaciones_de_paquetes_a_grupos(packages, trucks):
             print(f"Total peso: {assign['cluster']['total_weight']} kg")
             print(f"Total volumen: {assign['cluster']['total_volume']} m³")
             print(f"Capacidad restante: {assign['remaining_weight']} kg, {assign['remaining_volume']} m³")
+        print("")
 
-        print()
         total_weight_used = sum(a['cluster']['total_weight'] for a in assignments)
         total_weight_desperdiciado = sum(a['remaining_weight'] for a in assignments)
         total_volume_used = sum(a['cluster']['total_volume'] for a in assignments)
@@ -395,9 +413,9 @@ def asignaciones_de_paquetes_a_grupos(packages, trucks):
             total_weight_used / (total_weight_used + total_weight_desperdiciado) * 100:.2f
             }%) vs sin usar: {total_weight_desperdiciado} kg ({total_weight_desperdiciado / (total_weight_used + total_weight_desperdiciado) * 100:.2f}%)")
 
-        print(f"Total peso usado: {total_volume_used} kg ({
+        print(f"Total volumen usado: {total_volume_used} m³ ({
             total_volume_used  / (total_volume_used + total_volume_desperdiciado) * 100:.2f
-            }%) vs sin usar: {total_volume_desperdiciado} kg ({total_volume_desperdiciado / (total_volume_used + total_volume_desperdiciado) * 100:.2f}%)")
+            }%) vs sin usar: {total_volume_desperdiciado} m³ ({total_volume_desperdiciado / (total_volume_used + total_volume_desperdiciado) * 100:.2f}%)")
         print(f"Total camiones usados: {len(assignments)}")
 
         # Visualizar en el mapa
@@ -415,40 +433,41 @@ def asignaciones_de_paquetes_a_grupos(packages, trucks):
 
 def main(ver_grafo=False):
     # 1. Obtener el grafo de Miraflores
+    print("Obteniendo grafo de Miraflores...")
     graph = obtener_grafo_miraflores()
+    print("Grafo listo.")
+    print("")
 
     if ver_grafo:
         visualizar_grafo(graph)
         mostrar_informacion_del_grafo(graph)
 
     # 2. Importar paquetes
+    print("Importando paquetes...")
     paquetes = obtener_paquetes_con_coordenadas()
     for p in paquetes:
-        # if paquetes.lan o lon == 0.0, then print it
         if p['lat'] == None or p['lon'] == None:
             print(p)
     df_paquetes = pd.DataFrame([p for p in paquetes if p['lat'] != 0.0 and p['lon'] != 0.0])
-    print("Dimensiones de packages:", df_paquetes.shape)
-    print("Primeras filas de packages:\n", df_paquetes.head())
+    print("Paquetes importados:")
+    print(df_paquetes.head())
+    print("")
 
-    camiones_disponibles = [
-        {'id': 'T1', 'max_weight': 900, 'max_volume': 12},
-        {'id': 'T2', 'max_weight': 900, 'max_volume': 12},
-        {'id': 'T3', 'max_weight': 900, 'max_volume': 12},
-        {'id': 'T4', 'max_weight': 900, 'max_volume': 12},
-    ]
+    camiones_disponibles = []
 
     # 2. Asignar paquetes a camiones
+    print("Asignando paquetes a camiones...")
     se_asigno = False
     while se_asigno == False:
         id_new_camion = f"T{len(camiones_disponibles) + 1}"
-        new_camion = {'id': id_new_camion, 'max_weight': 900, 'max_volume': 12}
+        new_camion = {'id': id_new_camion, 'max_weight': 900, 'max_volume': 5}
         camiones_disponibles.append(new_camion)
 
         se_asigno = asignaciones_de_paquetes_a_grupos(df_paquetes, camiones_disponibles)
 
         if not se_asigno:
             print("Intentando de nuevo...")
+    print("Asignación de paquetes a camiones completada.")
 
 
 
