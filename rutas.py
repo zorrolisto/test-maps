@@ -8,15 +8,16 @@ import json
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
-from itertools import combinations
 
 from scipy.spatial.distance import pdist, squareform
 
 import folium
 
 from typing import List, Dict
-from ortools.linear_solver import pywraplp
+
+from sklearn.cluster import SpectralClustering, AffinityPropagation, DBSCAN, KMeans, MeanShift, estimate_bandwidth, AgglomerativeClustering, Birch
+from sklearn.mixture import GaussianMixture
+
 
 
 
@@ -232,6 +233,131 @@ def cluster_cost(cluster: Dict, truck: Dict) -> float:
     return cost
 
 
+# --- Funciones de agrupación con restricciones de capacidad ---
+
+def capacitated_dbscan(packages: pd.DataFrame, trucks: List[Dict], n_samples=5, eps=0.01, min_samples=5):
+    """
+    Agrupación con DBSCAN y restricciones de capacidad.
+    - packages: DataFrame con columnas ['lat','lon','weight','volume',...]
+    - trucks: lista de camiones con capacidad (usamos trucks[0] como referencia de capacidad para bin_packing_split).
+    - n_samples: cuántas veces probamos distintos muestreos/semillas para buscar la mejor solución.
+    - eps, min_samples: hiperparámetros de DBSCAN.
+    """
+    best_clusters = None
+    best_cost = float('inf')
+
+    for _ in range(n_samples):
+        # Tomar una muestra (por ejemplo, 80%) para inicializar
+        sample = packages.sample(frac=0.8, random_state=np.random.randint(100))
+
+        # Ajustar DBSCAN sobre la muestra para una idea inicial
+        # (aunque en DBSCAN lo más común es entrenar en todos los datos).
+        db_sample = DBSCAN(eps=eps, min_samples=min_samples)
+        db_sample.fit(sample[['lat', 'lon']])
+
+        # Ajustar DBSCAN en todos los datos para obtener etiquetas
+        db_all = DBSCAN(eps=eps, min_samples=min_samples)
+        db_all.fit(packages[['lat','lon']])
+        labels = db_all.labels_  # -1 significa ruido
+
+        # Crear clústeres ignorando el ruido (label = -1)
+        clusters = []
+        unique_labels = set(labels)
+        if -1 in unique_labels:
+            unique_labels.remove(-1)  # eliminamos ruido
+
+        for cluster_id in unique_labels:
+            sub_cluster = packages[labels == cluster_id]
+            # Dividir si excede capacidad o si supera 100 coordenadas (bin_packing_split)
+            sub_clusters = bin_packing_split(sub_cluster, trucks[0])
+            clusters.extend(sub_clusters)
+
+        # Calcular costo (distancia interna + penalización por capacidad)
+        cost = sum([cluster_cost(c, trucks[0]) for c in clusters])
+
+        # Guardar la mejor partición
+        if cost < best_cost:
+            best_clusters = clusters
+            best_cost = cost
+
+    return best_clusters
+
+def capacitated_spectral(packages: pd.DataFrame, trucks: List[Dict], n_samples=5, n_clusters=3):
+    """
+    Agrupa los paquetes usando Spectral Clustering y respeta las restricciones de capacidad.
+    - packages: DataFrame con columnas ['lat','lon','weight','volume',...]
+    - trucks: lista de camiones; se usa trucks[0] como referencia para dividir con bin_packing_split.
+    - n_samples: cantidad de veces que se prueba la agrupación para buscar la mejor solución.
+    - n_clusters: número de clústeres que queremos obtener.
+    """
+    best_clusters = None
+    best_cost = float('inf')
+    
+    for _ in range(n_samples):
+        # Tomamos una muestra (opcionalmente) para variar el random_state
+        sample = packages.sample(frac=0.8, random_state=np.random.randint(100))
+        
+        # Aplicamos Spectral Clustering a todos los datos
+        spectral = SpectralClustering(
+            n_clusters=n_clusters,
+            random_state=np.random.randint(100),
+            affinity='nearest_neighbors'  # o 'rbf', según convenga
+        )
+        labels = spectral.fit_predict(packages[['lat', 'lon']])
+        
+        clusters = []
+        for cluster_id in range(n_clusters):
+            sub_cluster = packages[labels == cluster_id]
+            # Dividimos si excede las restricciones de capacidad o el límite de 100 coordenadas
+            sub_clusters = bin_packing_split(sub_cluster, trucks[0])
+            clusters.extend(sub_clusters)
+        
+        # Calcular el costo total (distancia interna + penalización de capacidad)
+        cost = sum([cluster_cost(c, trucks[0]) for c in clusters])
+        
+        if cost < best_cost:
+            best_cost = cost
+            best_clusters = clusters
+            
+    return best_clusters
+
+def capacitated_clara_gm(packages: pd.DataFrame, trucks: List[Dict], n_samples=5, n_clusters=3):
+    """
+    Versión adaptada de CLARA usando Gaussian Mixture (en lugar de KMeans),
+    con restricciones de capacidad.
+    """
+    best_clusters = None
+    best_cost = float('inf')
+    
+    for _ in range(n_samples):
+        # Tomar muestra aleatoria de los paquetes (ej. 80%)
+        sample = packages.sample(frac=0.8, random_state=np.random.randint(100))
+        
+        # Ajustar Gaussian Mixture con la muestra
+        gm = GaussianMixture(n_components=n_clusters, random_state=np.random.randint(100))
+        gm.fit(sample[['lat', 'lon']])
+        
+        # Predecir etiquetas para TODOS los paquetes
+        all_labels = gm.predict(packages[['lat', 'lon']])
+        
+        # Generar clústeres
+        clusters = []
+        for cluster_id in range(n_clusters):
+            sub_cluster = packages[all_labels == cluster_id]
+            # Dividir si excede capacidad (similar a bin_packing_split)
+            sub_clusters = bin_packing_split(sub_cluster, trucks[0])
+            clusters.extend(sub_clusters)
+        
+        # Calcular “costo” (distancia interna + penalización por capacidad)
+        cost = sum([cluster_cost(c, trucks[0]) for c in clusters])
+        
+        # Ver si es la mejor solución
+        if cost < best_cost:
+            best_clusters = clusters
+            best_cost = cost
+    
+    return best_clusters
+
 def capacitated_clara(packages: pd.DataFrame, trucks: List[Dict], n_samples=5, n_clusters=3):
     """
     Versión adaptada de CLARA para clustering con restricciones de capacidad.
@@ -262,6 +388,89 @@ def capacitated_clara(packages: pd.DataFrame, trucks: List[Dict], n_samples=5, n
             best_cost = cost
     
     return best_clusters
+
+def capacitated_affinity_propagation(packages: pd.DataFrame, trucks: List[Dict],
+                                      damping=0.9, max_iter=200, convergence_iter=15):
+    """
+    Agrupa paquetes usando Affinity Propagation.
+    """
+    affinity = AffinityPropagation(damping=damping, max_iter=max_iter,
+                                    convergence_iter=convergence_iter, random_state=42)
+    labels = affinity.fit_predict(packages[['lat', 'lon']])
+    
+    clusters = []
+    for cluster_id in set(labels):
+        sub_cluster = packages[labels == cluster_id]
+        sub_clusters = bin_packing_split(sub_cluster, trucks[0])
+        clusters.extend(sub_clusters)
+        
+    return clusters
+
+def capacitated_meanshift(packages: pd.DataFrame, trucks: List[Dict],
+                          quantile=0.2, n_samples=500):
+    """
+    Agrupa paquetes usando MeanShift.
+    """
+    bandwidth = estimate_bandwidth(packages[['lat', 'lon']], quantile=quantile, n_samples=n_samples)
+    meanshift = MeanShift(bandwidth=bandwidth, bin_seeding=True)
+    labels = meanshift.fit_predict(packages[['lat', 'lon']])
+    
+    clusters = []
+    for cluster_id in set(labels):
+        sub_cluster = packages[labels == cluster_id]
+        sub_clusters = bin_packing_split(sub_cluster, trucks[0])
+        clusters.extend(sub_clusters)
+        
+    return clusters
+
+def capacitated_ward(packages: pd.DataFrame, trucks: List[Dict], n_clusters=3):
+    """
+    Agrupa paquetes usando Agglomerative Clustering con enlace 'ward'.
+    """
+    ward = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
+    labels = ward.fit_predict(packages[['lat', 'lon']])
+    
+    clusters = []
+    for cluster_id in range(n_clusters):
+        sub_cluster = packages[labels == cluster_id]
+        sub_clusters = bin_packing_split(sub_cluster, trucks[0])
+        clusters.extend(sub_clusters)
+        
+    return clusters
+
+def capacitated_agglomerative(packages: pd.DataFrame, trucks: List[Dict],
+                              n_clusters=3, linkage='average'):
+    """
+    Agrupa paquetes usando Agglomerative Clustering con enlace especificado (e.g., 'average').
+    """
+    agglo = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage)
+    labels = agglo.fit_predict(packages[['lat', 'lon']])
+    
+    clusters = []
+    for cluster_id in range(n_clusters):
+        sub_cluster = packages[labels == cluster_id]
+        sub_clusters = bin_packing_split(sub_cluster, trucks[0])
+        clusters.extend(sub_clusters)
+        
+    return clusters
+
+def capacitated_birch(packages: pd.DataFrame, trucks: List[Dict],
+                      threshold=0.5, n_clusters=3):
+    """
+    Agrupa paquetes usando Birch.
+    """
+    birch = Birch(threshold=threshold, n_clusters=n_clusters)
+    labels = birch.fit_predict(packages[['lat', 'lon']])
+    
+    clusters = []
+    for cluster_id in range(n_clusters):
+        sub_cluster = packages[labels == cluster_id]
+        sub_clusters = bin_packing_split(sub_cluster, trucks[0])
+        clusters.extend(sub_clusters)
+        
+    return clusters
+
+# --- FIN DE Funciones de agrupación con restricciones de capacidad ---
 
 def bin_packing_split(cluster: pd.DataFrame, truck: Dict):
     """
@@ -306,7 +515,6 @@ def bin_packing_split(cluster: pd.DataFrame, truck: Dict):
         clusters.append(current_cluster)
     
     return clusters
-
 
 def optimize_residual_space(assignments: List[Dict], trucks: List[Dict]):
     """
@@ -367,6 +575,14 @@ def multi_capacity_clustering(packages, trucks, max_retries=5):
     for _ in range(max_retries):
         # Usar CLARA en lugar de K-means puro
         clusters = capacitated_clara(packages, trucks, n_samples=5, n_clusters=len(trucks))
+        #clusters = capacitated_clara_gm(packages, trucks, n_samples=5, n_clusters=len(trucks))
+        # DESCARTADO clusters = capacitated_dbscan(packages, trucks, n_samples=5, eps=0.01, min_samples=5)
+        #clusters = capacitated_spectral(packages, trucks, n_samples=5, n_clusters=len(trucks))
+        #clusters = capacitated_meanshift(packages, trucks, quantile=0.2, n_samples=500)
+        # DESCARTADO clusters = capacitated_ward(packages, trucks, n_clusters=len(trucks))
+        # DESCARTADO clusters = capacitated_agglomerative(packages, trucks, n_clusters=len(trucks), linkage='average')
+        # DESCARTADO clusters = capacitated_affinity_propagation(packages, trucks, damping=0.9, max_iter=200, convergence_iter=15)
+
 
         # Asignar a camiones
         assignments, unassigned = assign_to_trucks(clusters, trucks_sorted)
