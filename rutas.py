@@ -18,7 +18,7 @@ from typing import List, Dict
 from sklearn.cluster import SpectralClustering, AffinityPropagation, DBSCAN, KMeans, MeanShift, estimate_bandwidth, AgglomerativeClustering, Birch
 from sklearn.mixture import GaussianMixture
 
-
+from shapely.geometry import Point, Polygon
 
 
 # ----- Funciones -----
@@ -678,7 +678,41 @@ def asignaciones_de_paquetes_a_grupos(packages, trucks):
         print("No se encontró una asignación válida.")
         return False
 
+def asignaciones_de_paquetes_a_locaciones(packages):
+    # Cargar los puntos de Miraflores desde el JSON
+    with open("puntos_miraflores.json", "r") as f:
+        puntos_miraflores = json.load(f)
 
+    assignments = []
+
+    for punto in puntos_miraflores:
+        puntos = [list(map(float, pt["map_point"].split(","))) for pt in punto['puntos']]
+        poligono = Polygon(puntos)
+
+        punto['paquetes'] = []  # Agregar la clave 'paquetes' al punto
+
+        for _, paquete in packages.iterrows():
+            try:
+                coordenada = (float(paquete['lat']), float(paquete['lon']))
+                punto_geom = Point(coordenada)
+
+                if poligono.contains(punto_geom):
+                    punto['paquetes'].append(paquete.to_dict())  # Convertir a diccionario
+
+            except (KeyError, ValueError) as e:
+                print(f"⚠️ Error con paquete: {paquete}, {e}")
+
+        assignments.append({
+            'truck_id': punto.get('zona_codigo', 'desconocido'),
+            'cluster': {
+                "packages": pd.DataFrame(punto['paquetes']) 
+            }
+        })
+
+    print("✅ Asignaciones generadas correctamente.")
+    map_assignments = plot_assignments_on_map(assignments)
+    map_assignments.save("mapa_asignaciones_loc.html")  # Guardar el mapa en un archivo HTML
+    print("\nMapa generado y guardado como 'mapa_asignaciones_loc.html'.")
 
 # ----- main -----
 
@@ -720,6 +754,9 @@ def main(ver_grafo=False):
         camiones_disponibles.append(new_camion)
 
         se_asigno = asignaciones_de_paquetes_a_grupos(df_paquetes, camiones_disponibles)
+
+        if se_asigno == True:
+            asignaciones_de_paquetes_a_locaciones(df_paquetes)
 
         if not se_asigno:
             print("Intentando de nuevo...")
