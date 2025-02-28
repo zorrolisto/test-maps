@@ -74,12 +74,12 @@ def obtener_paquetes_con_coordenadas():
         paquetes = json.load(f)
 
     df = pd.read_excel("389657_21311_1740606018 (1).xlsx", engine="openpyxl")
-    filtered_df = df[
-        (df["LOCALIDAD"] == "MIRAFLORES - LIMA - LIMA") &
-        (df["FECHA AO"] == "21/02/2025") &
-        (df["FECHA VISITA 1"] == "22/02/2025") &
-        (df["DESTINO"] == "LIM")
-    ]
+    filtered_df = df#[
+        #(df["LOCALIDAD"] == "MIRAFLORES - LIMA - LIMA") &
+        #(df["FECHA AO"] == "21/02/2025") &
+        #(df["FECHA VISITA 1"] == "22/02/2025") &
+        #(df["DESTINO"] == "LIM")
+    #]
     # ahora solo obtener en este df el "PESO BALANZA", "PESO VOLUMEN" y "GUIA"
     filtered_df = filtered_df[["PESO BALANZA", "PESO VOLUMEN", "GUIA"]]
 
@@ -87,6 +87,8 @@ def obtener_paquetes_con_coordenadas():
 
     for idx, paquete in enumerate(paquetes):
         coordenadas = paquete["coordenadas"]
+        if coordenadas == "0 , 0":
+            coordenadas = paquete["coordenada_puerta"]
         lat, lon = map(float, map(str.strip, coordenadas.split(",")))
         id = idx
 
@@ -96,18 +98,20 @@ def obtener_paquetes_con_coordenadas():
         if len(peso_values) > 0:
             weight = peso_values[0]
         else:
+            print("No se encontró el peso del paquete con guia: ", paquete["numero_guia"])
             weight = None  # O algún valor por defecto
 
         peso_volumen_values = filtered_df[filtered_df["GUIA"] == paquete["numero_guia"]]["PESO VOLUMEN"].values
         if len(peso_volumen_values) > 0:
             volume = (peso_volumen_values[0] * 5000)/1000000
         else:
+            print("No se encontró el volumen del paquete con guia: ", paquete["numero_guia"])
             volume = None
 
         # verify exist if not exist, then don't append
         if weight == None or volume == None:
             continue
-        paquetes_coordinadas_only.append({ "id": id, "lat": lat, "lon": lon, "direccion": paquete["dir_calle"],  "weight": weight, "volume": volume })
+        paquetes_coordinadas_only.append({ "id": id, "lat": lat, "lon": lon, "direccion": paquete["dir_calle"],  "weight": weight, "volume": volume, "numero_guia": paquete["numero_guia"] })
 
     return paquetes_coordinadas_only
 
@@ -261,49 +265,52 @@ def capacitated_clara(packages: pd.DataFrame, trucks: List[Dict], n_samples=5, n
 
 def bin_packing_split(cluster: pd.DataFrame, truck: Dict):
     """
-    Divide un cluster usando algoritmo de bin packing 2D (peso + volumen).
+    Divide un cluster en subclusters de máximo 100 coordenadas únicas (lat, lon),
+    respetando las restricciones de peso y volumen del camión.
     """
-    solver = pywraplp.Solver.CreateSolver('SCIP')
-    items = [{'weight': row.weight, 'volume': row.volume} for _, row in cluster.iterrows()]
-    
-    # Variables de decisión
-    x = {}
-    for i in range(len(items)):
-        for b in range(len(items)):
-            x[i, b] = solver.IntVar(0, 1, f'x_{i}_{b}')
-    
-    # Restricciones
-    for i in range(len(items)):
-        solver.Add(sum(x[i, b] for b in range(len(items))) == 1)
-    
-    for b in range(len(items)):
-        solver.Add(sum(items[i]['weight'] * x[i, b] for i in range(len(items))) <= truck['max_weight'])
-        solver.Add(sum(items[i]['volume'] * x[i, b] for i in range(len(items))) <= truck['max_volume'])
-    
-    # Resolver
-    status = solver.Solve()
-
-    if status != pywraplp.Solver.OPTIMAL and status != pywraplp.Solver.FEASIBLE:
-        raise Exception("No se encontró una solución válida para el bin packing")
-
-    
-    # Recuperar clusters
     clusters = []
-    for b in range(len(items)):
-        cluster_b = cluster.iloc[[i for i in range(len(items)) if x[i, b].solution_value() == 1]]
-        if not cluster_b.empty:
-            clusters.append({
-                'total_weight': cluster_b['weight'].sum(),
-                'total_volume': cluster_b['volume'].sum(),
-                'packages': cluster_b
-            })
+    
+    # Agrupar paquetes por coordenadas únicas
+    coord_groups = cluster.groupby(['lat', 'lon'])
+    
+    current_cluster = {
+        'total_weight': 0,
+        'total_volume': 0,
+        'packages': pd.DataFrame(columns=cluster.columns),
+        'unique_coords': set()
+    }
+    
+    for (lat, lon), packages in coord_groups:
+        # Si añadir esta coordenada excede las 100 únicas, se inicia un nuevo clúster
+        if len(current_cluster['unique_coords']) >= 100:
+            clusters.append(current_cluster)
+            current_cluster = {
+                'total_weight': 0,
+                'total_volume': 0,
+                'packages': pd.DataFrame(columns=cluster.columns),
+                'unique_coords': set()
+            }
+        
+        # Agregar paquetes de esta coordenada al clúster actual
+        if current_cluster['packages'].empty:
+            current_cluster['packages'] = packages
+        else:
+            current_cluster['packages'] = pd.concat([current_cluster['packages'], packages])
+
+        current_cluster['total_weight'] += packages['weight'].sum()
+        current_cluster['total_volume'] += packages['volume'].sum()
+        current_cluster['unique_coords'].add((lat, lon))
+    
+    # Agregar el último clúster si contiene paquetes
+    if not current_cluster['packages'].empty:
+        clusters.append(current_cluster)
     
     return clusters
 
 
 def optimize_residual_space(assignments: List[Dict], trucks: List[Dict]):
     """
-    Combina clusters pequeños para llenar espacios residuales.
+    Combina clusters pequeños para llenar espacios residuales, asegurando que no superen las 100 coordenadas únicas.
     """
     for truck in reversed(trucks):  # Empezar con camiones grandes
         for assignment in assignments:
@@ -316,7 +323,14 @@ def optimize_residual_space(assignments: List[Dict], trucks: List[Dict]):
                     if (candidate['truck_id'] != truck['id'] and 
                         candidate['cluster']['total_weight'] <= remaining_weight and 
                         candidate['cluster']['total_volume'] <= remaining_volume):
-                        
+
+                        # Verificar si la fusión excederá las 100 coordenadas únicas
+                        merged_coords = set(assignment['cluster']['packages'][['lat', 'lon']].apply(tuple, axis=1))
+                        candidate_coords = set(candidate['cluster']['packages'][['lat', 'lon']].apply(tuple, axis=1))
+
+                        if len(merged_coords | candidate_coords) > 100:
+                            continue  # Si excede, no fusionar este candidato
+
                         # Fusionar clusters
                         assignment['cluster']['packages'] = pd.concat([
                             assignment['cluster']['packages'],
@@ -327,8 +341,22 @@ def optimize_residual_space(assignments: List[Dict], trucks: List[Dict]):
                         assignment['cluster']['total_volume'] += candidate['cluster']['total_volume']
                         assignment['remaining_volume'] -= candidate['cluster']['total_volume']
                         assignments.remove(candidate)
-                        break
+                        break  # Solo fusionar un clúster por iteración
+                        
     return assignments
+
+def limitar_paquetes_cluster(clusters):
+    for cluster in clusters:
+        # Filtrar paquetes únicos según lat y lon
+        paquetes_unicos = cluster['packages'].drop_duplicates(subset=['lat', 'lon'])
+        # Si hay más de 100, se seleccionan 100 al azar
+        if len(paquetes_unicos) > 100:
+            paquetes_unicos = paquetes_unicos.sample(n=100, random_state=42)
+        # Actualizar el cluster con los paquetes limitados y recalcular totales
+        cluster['packages'] = paquetes_unicos
+        cluster['total_weight'] = paquetes_unicos['weight'].sum()
+        cluster['total_volume'] = paquetes_unicos['volume'].sum()
+    return clusters
 
 # --- Modificar la función principal ---
 def multi_capacity_clustering(packages, trucks, max_retries=5):
@@ -339,7 +367,7 @@ def multi_capacity_clustering(packages, trucks, max_retries=5):
     for _ in range(max_retries):
         # Usar CLARA en lugar de K-means puro
         clusters = capacitated_clara(packages, trucks, n_samples=5, n_clusters=len(trucks))
-        
+
         # Asignar a camiones
         assignments, unassigned = assign_to_trucks(clusters, trucks_sorted)
         
@@ -418,6 +446,13 @@ def asignaciones_de_paquetes_a_grupos(packages, trucks):
             }%) vs sin usar: {total_volume_desperdiciado} m³ ({total_volume_desperdiciado / (total_volume_used + total_volume_desperdiciado) * 100:.2f}%)")
         print(f"Total camiones usados: {len(assignments)}")
 
+        #print el total de paquetes en los camiones
+        total_paquetes = 0
+        for assign in assignments:
+            total_paquetes += len(assign['cluster']['packages'])
+        print(f"Total paquetes en los camiones: {total_paquetes}")
+
+
         # Visualizar en el mapa
         map_assignments = plot_assignments_on_map(assignments)
         map_assignments.save("mapa_asignaciones.html")  # Guardar el mapa en un archivo HTML
@@ -447,8 +482,13 @@ def main(ver_grafo=False):
     paquetes = obtener_paquetes_con_coordenadas()
     for p in paquetes:
         if p['lat'] == None or p['lon'] == None:
+            print("None para paquete con guia: ", p["numero_guia"])
+            print(p)
+        if p['lat'] == 0.0 or p['lon'] == 0.0:
+            print("0.0 para paquete con guia: ", p["numero_guia"])
             print(p)
     df_paquetes = pd.DataFrame([p for p in paquetes if p['lat'] != 0.0 and p['lon'] != 0.0])
+    print("cantidad de paquetes: ", len(df_paquetes))
     print("Paquetes importados:")
     print(df_paquetes.head())
     print("")
