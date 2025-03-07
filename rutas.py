@@ -1151,8 +1151,8 @@ def main(json_file_names, puntos_files_names):
     while se_asigno == False:
         se_asigno = asignaciones_de_paquetes_a_grupos(df_paquetes, camiones_disponibles)
 
-        if se_asigno == True:
-            asignaciones_de_paquetes_a_locaciones(df_paquetes, puntos_files_names)
+        #if se_asigno == True:
+            #asignaciones_de_paquetes_a_locaciones(df_paquetes, puntos_files_names)
 
         if not se_asigno:
             id_new_camion = f"T{len(camiones_disponibles) + 1}"
