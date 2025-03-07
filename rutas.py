@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import json
 
 import numpy as np
+from numpy import radians, sin, cos, arctan2, sqrt
+
 import pandas as pd
 
 from scipy.spatial.distance import pdist, squareform
@@ -19,6 +21,12 @@ from sklearn.cluster import SpectralClustering, AffinityPropagation, DBSCAN, KMe
 from sklearn.mixture import GaussianMixture
 
 from shapely.geometry import Point, Polygon
+
+import time
+
+from folium.plugins import FastMarkerCluster
+
+import math
 
 
 # ----- Funciones -----
@@ -70,11 +78,13 @@ def mostrar_informacion_del_grafo(graph):
     print("\nEjemplo de arista (calle):")
     print(edges_gdf[["length", "geometry", "highway", "oneway"]].head(3))
 
-def obtener_paquetes_con_coordenadas():
-    with open("paquetes.json", "r") as f:
-        paquetes = json.load(f)
+def obtener_paquetes_con_coordenadas_aux(json_files_names):
+    paquetes = []
+    for json_file_name in json_files_names:
+        with open("paquetes/" + json_file_name, "r") as f:
+            paquetes.extend(json.load(f))
 
-    df = pd.read_excel("389657_21311_1740606018 (1).xlsx", engine="openpyxl")
+    df = pd.read_excel("datos_de_pesos_y_guias.xlsx", engine="openpyxl")
     filtered_df = df#[
         #(df["LOCALIDAD"] == "MIRAFLORES - LIMA - LIMA") &
         #(df["FECHA AO"] == "21/02/2025") &
@@ -113,6 +123,55 @@ def obtener_paquetes_con_coordenadas():
         if weight == None or volume == None:
             continue
         paquetes_coordinadas_only.append({ "id": id, "lat": lat, "lon": lon, "direccion": paquete["dir_calle"],  "weight": weight, "volume": volume, "numero_guia": paquete["numero_guia"] })
+
+    return paquetes_coordinadas_only
+ 
+def obtener_paquetes_con_coordenadas(json_files_names):
+    paquetes = []
+    for json_file_name in json_files_names:
+        with open("paquetes/" + json_file_name, "r") as f:
+            paquetes.extend(json.load(f))
+
+    # Leer el Excel y quedarnos solo con las columnas relevantes
+    df = pd.read_excel("datos_de_pesos_y_guias.xlsx", engine="openpyxl")
+    df = df[["GUIA", "PESO BALANZA", "PESO VOLUMEN"]].dropna()
+
+    # Eliminar duplicados dejando el primer registro por cada GUIA
+    df = df.groupby("GUIA").first().reset_index()
+
+    # Convertir en diccionario para acceso rápido
+    datos_guia = df.set_index("GUIA").to_dict("index")
+
+    paquetes_coordinadas_only = []
+
+    for idx, paquete in enumerate(paquetes):
+        coord = paquete["coordenadas"]
+        if coord == "0 , 0":
+            coord = paquete["coordenada_puerta"]
+
+        try:
+            lat, lon = map(float, map(str.strip, coord.split(",")))
+        except ValueError:
+            print("Error al procesar coordenadas:", coord)
+            continue
+
+        guia = paquete["numero_guia"]
+        if guia not in datos_guia:
+            print("No se encontró datos para la guia:", guia)
+            continue
+
+        weight = datos_guia[guia]["PESO BALANZA"]
+        volume = (datos_guia[guia]["PESO VOLUMEN"] * 5000) / 1000000
+
+        paquetes_coordinadas_only.append({
+            "id": idx,
+            "lat": lat,
+            "lon": lon,
+            "direccion": paquete["dir_calle"],
+            "weight": weight,
+            "volume": volume,
+            "numero_guia": guia
+        })
 
     return paquetes_coordinadas_only
 
@@ -367,7 +426,7 @@ def capacitated_clara(packages: pd.DataFrame, trucks: List[Dict], n_samples=5, n
     
     for _ in range(n_samples):
         # Muestra aleatoria del 80% de los datos
-        sample = packages.sample(frac=0.8)
+        sample = packages.sample(frac=0.7)
         kmeans = KMeans(n_clusters=n_clusters, n_init=10)
         kmeans.fit(sample[['lat', 'lon']])
         
@@ -472,7 +531,7 @@ def capacitated_birch(packages: pd.DataFrame, trucks: List[Dict],
 
 # --- FIN DE Funciones de agrupación con restricciones de capacidad ---
 
-def bin_packing_split(cluster: pd.DataFrame, truck: Dict):
+def bin_packing_split_1(cluster: pd.DataFrame, truck: Dict):
     """
     Divide un cluster en subclusters de máximo 100 coordenadas únicas (lat, lon),
     respetando las restricciones de peso y volumen del camión.
@@ -515,6 +574,261 @@ def bin_packing_split(cluster: pd.DataFrame, truck: Dict):
         clusters.append(current_cluster)
     
     return clusters
+
+def bin_packing_split_2(cluster: pd.DataFrame, truck: dict, distance_threshold=5):
+    """
+    Divide un cluster en subclusters de máximo 100 coordenadas únicas, respetando
+    las restricciones de peso y volumen del camión, e incorporando un criterio espacial.
+    """
+    clusters = []
+    
+    # Agrupar paquetes por coordenadas únicas
+    coord_groups = cluster.groupby(['lat', 'lon'])
+    
+    current_cluster = {
+        'total_weight': 0,
+        'total_volume': 0,
+        'packages': pd.DataFrame(columns=cluster.columns),
+        'unique_coords': set()
+    }
+    
+    for (lat, lon), packages in coord_groups:
+        # Calcular el peso y volumen que se sumarían
+        new_weight = current_cluster['total_weight'] + packages['weight'].sum()
+        new_volume = current_cluster['total_volume'] + packages['volume'].sum()
+        
+        # Determinar si la nueva coordenada está muy lejos del centroide actual
+        add_new_cluster = False
+        if current_cluster['unique_coords']:
+            coords = list(current_cluster['unique_coords'])
+            centroid_lat = sum(coord[0] for coord in coords) / len(coords)
+            centroid_lon = sum(coord[1] for coord in coords) / len(coords)
+            # Aproximación Euclídea (1 grado ≈ 111 km)
+            distance = ((centroid_lat - lat)**2 + (centroid_lon - lon)**2)**0.5 * 111
+            if distance > distance_threshold:
+                add_new_cluster = True
+
+        # Si se exceden las restricciones o el criterio espacial se cumple, se inicia un nuevo clúster
+        if (new_weight > truck['max_weight'] or 
+            new_volume > truck['max_volume'] or 
+            len(current_cluster['unique_coords']) >= 100 or 
+            add_new_cluster):
+            clusters.append(current_cluster)
+            current_cluster = {
+                'total_weight': 0,
+                'total_volume': 0,
+                'packages': pd.DataFrame(columns=cluster.columns),
+                'unique_coords': set()
+            }
+        
+        # Agregar paquetes de esta coordenada
+        if current_cluster['packages'].empty:
+            current_cluster['packages'] = packages
+        else:
+            current_cluster['packages'] = pd.concat([current_cluster['packages'], packages])
+        current_cluster['total_weight'] += packages['weight'].sum()
+        current_cluster['total_volume'] += packages['volume'].sum()
+        current_cluster['unique_coords'].add((lat, lon))
+    
+    # Agregar el último clúster si contiene paquetes
+    if not current_cluster['packages'].empty:
+        clusters.append(current_cluster)
+    
+    # Fusión post-proceso de clústers geográficamente cercanos
+    merged_clusters = merge_clusters(clusters, truck, distance_threshold)
+    return merged_clusters
+
+def merge_clusters(clusters, truck: dict, distance_threshold=5):
+    """
+    Fusiona clústers que están geográficamente cerca y cuya combinación respeta
+    las restricciones de peso y volumen del camión.
+    """
+    merged = []
+    used = [False] * len(clusters)
+    
+    for i in range(len(clusters)):
+        if used[i]:
+            continue
+        base = clusters[i]
+        base_coords = list(base['unique_coords'])
+        centroid_lat = sum(coord[0] for coord in base_coords) / len(base_coords)
+        centroid_lon = sum(coord[1] for coord in base_coords) / len(base_coords)
+        
+        merged_cluster = {
+            'total_weight': base['total_weight'],
+            'total_volume': base['total_volume'],
+            'packages': base['packages'],
+            'unique_coords': set(base['unique_coords'])
+        }
+        used[i] = True
+        
+        for j in range(i+1, len(clusters)):
+            if used[j]:
+                continue
+            other = clusters[j]
+            other_coords = list(other['unique_coords'])
+            other_centroid_lat = sum(coord[0] for coord in other_coords) / len(other_coords)
+            other_centroid_lon = sum(coord[1] for coord in other_coords) / len(other_coords)
+            
+            # Aproximación Euclídea convertida a km
+            distance = (((centroid_lat - other_centroid_lat)**2 + (centroid_lon - other_centroid_lon)**2)**0.5) * 111
+            if distance <= distance_threshold:
+                # Verificar que al fusionar se cumplan las restricciones
+                if (merged_cluster['total_weight'] + other['total_weight'] <= truck['max_weight'] and 
+                    merged_cluster['total_volume'] + other['total_volume'] <= truck['max_volume']):
+                    merged_cluster['total_weight'] += other['total_weight']
+                    merged_cluster['total_volume'] += other['total_volume']
+                    merged_cluster['packages'] = pd.concat([merged_cluster['packages'], other['packages']])
+                    merged_cluster['unique_coords'].update(other['unique_coords'])
+                    used[j] = True
+        merged.append(merged_cluster)
+    return merged
+
+def bin_packing_split(cluster: pd.DataFrame, truck: Dict, max_coords=100, max_distance_km=2.0):
+    """
+    Divide un cluster en subclusters respetando:
+    1. Máximo de coordenadas únicas por cluster
+    2. Proximidad espacial (grupos cercanos juntos)
+    3. Restricciones de peso y volumen del camión
+    """
+    # Si el cluster está vacío o ya cumple con las restricciones, devolverlo directamente
+    if cluster.empty or (
+        len(cluster.groupby(['lat', 'lon'])) <= max_coords and
+        cluster['weight'].sum() <= truck['max_weight'] and
+        cluster['volume'].sum() <= truck['max_volume']
+    ):
+        return [{
+            'total_weight': cluster['weight'].sum(),
+            'total_volume': cluster['volume'].sum(),
+            'packages': cluster,
+            'unique_coords': set(zip(cluster['lat'], cluster['lon']))
+        }]
+    
+    # Paso 1: Calcular el centro geográfico del cluster
+    center_lat = cluster['lat'].mean()
+    center_lon = cluster['lon'].mean()
+    
+    # Paso 2: Calcular la distancia de cada coordenada al centro
+    coord_groups = []
+    for (lat, lon), group in cluster.groupby(['lat', 'lon']):
+        # Calcular distancia al centro usando la fórmula de Haversine
+        distance = haversine_distance(center_lat, center_lon, lat, lon)
+        coord_groups.append({
+            'lat': lat,
+            'lon': lon,
+            'distance': distance,
+            'packages': group,
+            'weight': group['weight'].sum(),
+            'volume': group['volume'].sum()
+        })
+    
+    # Paso 3: Ordenar las coordenadas por distancia al centro (más cercanas primero)
+    coord_groups.sort(key=lambda x: x['distance'])
+    
+    # Paso 4: Formar clusters con restricciones espaciales y de capacidad
+    clusters = []
+    current_cluster = {
+        'total_weight': 0,
+        'total_volume': 0,
+        'packages': pd.DataFrame(columns=cluster.columns),
+        'unique_coords': set(),
+        'center_lat': center_lat,
+        'center_lon': center_lon
+    }
+    
+    for coord_group in coord_groups:
+        # Verificar si agregar este grupo excede las capacidades o el límite de coordenadas
+        if (len(current_cluster['unique_coords']) + 1 > max_coords or
+            current_cluster['total_weight'] + coord_group['weight'] > truck['max_weight'] or
+            current_cluster['total_volume'] + coord_group['volume'] > truck['max_volume']):
+            
+            # Si el cluster actual no está vacío, guardarlo
+            if not current_cluster['packages'].empty:
+                # Recalcular el centro del cluster actual
+                if len(current_cluster['unique_coords']) > 0:
+                    current_cluster['center_lat'] = current_cluster['packages']['lat'].mean()
+                    current_cluster['center_lon'] = current_cluster['packages']['lon'].mean()
+                
+                clusters.append({
+                    'total_weight': current_cluster['total_weight'],
+                    'total_volume': current_cluster['total_volume'],
+                    'packages': current_cluster['packages'],
+                    'unique_coords': current_cluster['unique_coords']
+                })
+            
+            # Iniciar un nuevo cluster
+            current_cluster = {
+                'total_weight': 0,
+                'total_volume': 0,
+                'packages': pd.DataFrame(columns=cluster.columns),
+                'unique_coords': set(),
+                'center_lat': center_lat,
+                'center_lon': center_lon
+            }
+        
+        # Verificar la distancia máxima para mantener la cohesión espacial
+        # Si el cluster no está vacío, verificar que la nueva coordenada no esté demasiado lejos
+        if not current_cluster['packages'].empty:
+            new_center_lat = (current_cluster['packages']['lat'].sum() + coord_group['packages']['lat'].sum()) / (
+                len(current_cluster['packages']) + len(coord_group['packages'])
+            )
+            new_center_lon = (current_cluster['packages']['lon'].sum() + coord_group['packages']['lon'].sum()) / (
+                len(current_cluster['packages']) + len(coord_group['packages'])
+            )
+            
+            # Calcular la distancia máxima desde cualquier punto al nuevo centro
+            max_dist = 0
+            for lat, lon in list(current_cluster['unique_coords']) + [(coord_group['lat'], coord_group['lon'])]:
+                dist = haversine_distance(new_center_lat, new_center_lon, lat, lon)
+                max_dist = max(max_dist, dist)
+            
+            # Si la distancia máxima es mayor que el umbral, iniciar un nuevo cluster
+            if max_dist > max_distance_km and not current_cluster['packages'].empty:
+                clusters.append({
+                    'total_weight': current_cluster['total_weight'],
+                    'total_volume': current_cluster['total_volume'],
+                    'packages': current_cluster['packages'],
+                    'unique_coords': current_cluster['unique_coords']
+                })
+                
+                # Iniciar un nuevo cluster con este grupo
+                current_cluster = {
+                    'total_weight': 0,
+                    'total_volume': 0,
+                    'packages': pd.DataFrame(columns=cluster.columns),
+                    'unique_coords': set(),
+                    'center_lat': center_lat,
+                    'center_lon': center_lon
+                }
+        
+        # Agregar este grupo al cluster actual
+        if current_cluster['packages'].empty:
+            current_cluster['packages'] = coord_group['packages']
+        else:
+            current_cluster['packages'] = pd.concat([current_cluster['packages'], coord_group['packages']])
+        
+        current_cluster['total_weight'] += coord_group['weight']
+        current_cluster['total_volume'] += coord_group['volume']
+        current_cluster['unique_coords'].add((coord_group['lat'], coord_group['lon']))
+    
+    # Agregar el último cluster si contiene paquetes
+    if not current_cluster['packages'].empty:
+        clusters.append({
+            'total_weight': current_cluster['total_weight'],
+            'total_volume': current_cluster['total_volume'],
+            'packages': current_cluster['packages'],
+            'unique_coords': current_cluster['unique_coords']
+        })
+    
+    return clusters
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    return 2 * R * arctan2(sqrt(a), sqrt(1-a))
 
 def optimize_residual_space(assignments: List[Dict], trucks: List[Dict]):
     """
@@ -574,7 +888,7 @@ def multi_capacity_clustering(packages, trucks, max_retries=5):
     
     for _ in range(max_retries):
         # Usar CLARA en lugar de K-means puro
-        clusters = capacitated_clara(packages, trucks, n_samples=5, n_clusters=len(trucks))
+        clusters = capacitated_clara(packages, trucks, n_samples=3, n_clusters=len(trucks))
         #clusters = capacitated_clara_gm(packages, trucks, n_samples=5, n_clusters=len(trucks))
         # DESCARTADO clusters = capacitated_dbscan(packages, trucks, n_samples=5, eps=0.01, min_samples=5)
         #clusters = capacitated_spectral(packages, trucks, n_samples=5, n_clusters=len(trucks))
@@ -596,38 +910,104 @@ def multi_capacity_clustering(packages, trucks, max_retries=5):
     
     return best_assignment
 
-
-
-def plot_assignments_on_map(assignments):
+def plot_assignments_on_map_aux(assignments):
     # Crear un mapa centrado en Miraflores, Lima
     map_center = [-12.111, -77.031]  # Coordenadas de Miraflores
     m = folium.Map(location=map_center, zoom_start=14)
 
+    points = []  # Lista de coordenadas para FastMarkerCluster
+
     # Colores para diferenciar camiones
     colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige', 
-              'darkblue', 'darkgreen', 'cadetblue', 'darkpurple', 'pink', 'lightblue', 
-              'lightgreen', 'gray', 'black', 'lightgray']
+                'darkblue', 'darkgreen', 'cadetblue', 'darkpurple', 'pink', 'lightblue', 
+                'lightgreen', 'gray', 'black', 'lightgray', 'white']
 
     # Añadir marcadores para cada camión y sus paquetes
     for i, assign in enumerate(assignments):
-        truck_id = assign['truck_id']
+        truck_id = i #assign['truck_id']
         cluster = assign['cluster']
         color = colors[i % len(colors)]  # Asignar un color único por camión
+
+        #print(type(cluster['packages']))
+        #print(cluster['packages'].head())  # Muestra las primeras filas
+
+        if not isinstance(cluster['packages'], pd.DataFrame):
+        #    print("Error: 'packages' no es un DataFrame:", type(cluster['packages']))
+            continue  # Evita que el código falle
+        if 'lat' not in cluster['packages'].columns or 'lon' not in cluster['packages'].columns:
+        #    print("Error: Faltan columnas en 'packages':", cluster['packages'].columns)
+            continue  # Evita que el código falle
+
 
         # Añadir marcador para el camión (punto de partida)
         folium.Marker(
             location=[cluster['packages']['lat'].mean(), cluster['packages']['lon'].mean()],
-            popup=f"Camion {truck_id}",
+            popup=f"Camion: {i + 1}, Paquetes: {len(cluster['packages'])}",
             icon=folium.Icon(color=color, icon='truck', prefix='fa')
         ).add_to(m)
 
+        points.extend([[row['lat'], row['lon']] for _, row in cluster['packages'].iterrows()])
+
         # Añadir marcadores para los paquetes del camión
+        #for _, row in cluster['packages'].iterrows():
+            #folium.Marker(
+            #    location=[row['lat'], row['lon']],
+            #    popup=f"Paquete: {row['weight']} kg, {row['volume']} ton, Camion: {i + 1}",#{truck_id}",
+            #    icon=folium.Icon(color=color, icon='box', prefix='fa')
+            #).add_to(m)
+
+
+    FastMarkerCluster(points).add_to(m)  # Renderizar con FastMarkerCluster
+
+    return m
+
+def plot_assignments_on_map(assignments):
+    # Crear un mapa centrado en Miraflores, Lima
+    map_center = [-12.111, -77.031]
+    m = folium.Map(location=map_center, zoom_start=14)
+
+    colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige', 
+              'darkblue', 'darkgreen', 'cadetblue', 'darkpurple', 'pink', 'lightblue', 
+              'lightgreen', 'gray', 'black', 'lightgray', 'white']
+
+    for i, assign in enumerate(assignments):
+        truck_id = i
+        cluster = assign['cluster']
+        color = colors[i % len(colors)]
+
+        if not isinstance(cluster['packages'], pd.DataFrame) or 'lat' not in cluster['packages'].columns or 'lon' not in cluster['packages'].columns:
+            continue  # Evita errores
+
+        first_package = cluster['packages'].iloc[0]  # Primer paquete
+        truck_lat, truck_lon = first_package['lat'], first_package['lon']
+
+        # Crear un FeatureGroup para el camión y sus paquetes
+        truck_group = folium.FeatureGroup(name=f"Camión {i + 1}")
+
+        folium.Marker(
+            location=[truck_lat, truck_lon],
+            popup=f"Camión: {i + 1}, Paquetes: {len(cluster['packages'])}",
+            icon=folium.Icon(color=color, icon='truck', prefix='fa')
+        ).add_to(truck_group)
+
+
+        # Añadir los paquetes dentro del grupo del camión
         for _, row in cluster['packages'].iterrows():
-            folium.Marker(
+            folium.CircleMarker(
                 location=[row['lat'], row['lon']],
-                popup=f"Paquete: {row['weight']} kg, {row['volume']} ton",
-                icon=folium.Icon(color=color, icon='box', prefix='fa')
-            ).add_to(m)
+                radius=5,
+                color=color,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.6,
+                popup=f"Paquete: {row.get('weight', 'N/A')} kg, {row.get('volume', 'N/A')} ton, Camión: {i + 1}"
+            ).add_to(truck_group)
+
+        # Agregar el grupo al mapa
+        truck_group.add_to(m)
+
+    # Agregar control de capas para activar/desactivar camiones y paquetes
+    folium.LayerControl(collapsed=False).add_to(m)
 
     return m
 
@@ -640,12 +1020,10 @@ def asignaciones_de_paquetes_a_grupos(packages, trucks):
     # Mostrar resultados
     if assignments:
         print("Asignación de camiones:")
-        for assign in assignments:
-            print(f"\nCamión {assign['truck_id']}:")
-            print(assign['cluster']['packages'][['weight', 'volume', 'lat', 'lon']])
-            print(f"Total peso: {assign['cluster']['total_weight']} kg")
-            print(f"Total volumen: {assign['cluster']['total_volume']} m³")
-            print(f"Capacidad restante: {assign['remaining_weight']} kg, {assign['remaining_volume']} m³")
+        for i, assign in enumerate(assignments):
+            print(f"\nCamión {i + 1}: Peso U: {round(assign['cluster']['total_weight'], 2)} kg, Volumen U: {round(assign['cluster']['total_volume'], 2)} m³")
+            print(f"Total de paquetes enviados: {len(assign['cluster']['packages'])}")
+            print(f"Capacidad Restante: {round(assign['remaining_weight'], 2)} kg, {round(assign['remaining_volume'], 2)} m³")
         print("")
 
         total_weight_used = sum(a['cluster']['total_weight'] for a in assignments)
@@ -653,35 +1031,42 @@ def asignaciones_de_paquetes_a_grupos(packages, trucks):
         total_volume_used = sum(a['cluster']['total_volume'] for a in assignments)
         total_volume_desperdiciado = sum(a['remaining_volume'] for a in assignments)
 
-        print(f"Total peso usado: {total_weight_used} kg ({
-            total_weight_used / (total_weight_used + total_weight_desperdiciado) * 100:.2f
-            }%) vs sin usar: {total_weight_desperdiciado} kg ({total_weight_desperdiciado / (total_weight_used + total_weight_desperdiciado) * 100:.2f}%)")
+        print("")
+        print(f"Total peso usado: {round(total_weight_used, 2)} kg")# ({
+            #total_weight_used / (total_weight_used + total_weight_desperdiciado) * 100:.2f
+            #}%) vs sin usar: {total_weight_desperdiciado} kg ({total_weight_desperdiciado / (total_weight_used + total_weight_desperdiciado) * 100:.2f}%)")
 
-        print(f"Total volumen usado: {total_volume_used} m³ ({
-            total_volume_used  / (total_volume_used + total_volume_desperdiciado) * 100:.2f
-            }%) vs sin usar: {total_volume_desperdiciado} m³ ({total_volume_desperdiciado / (total_volume_used + total_volume_desperdiciado) * 100:.2f}%)")
+        print(f"Total volumen usado: {round(total_volume_used, 2)} m³")# ({
+            #total_volume_used  / (total_volume_used + total_volume_desperdiciado) * 100:.2f
+            #}%) vs sin usar: {total_volume_desperdiciado} m³ ({total_volume_desperdiciado / (total_volume_used + total_volume_desperdiciado) * 100:.2f}%)")
         print(f"Total camiones usados: {len(assignments)}")
+        print(f"Promedio paquetes por camión: {len(packages) / len(assignments):.2f}")
 
         #print el total de paquetes en los camiones
         total_paquetes = 0
         for assign in assignments:
             total_paquetes += len(assign['cluster']['packages'])
         print(f"Total paquetes en los camiones: {total_paquetes}")
+        print("")
 
 
         # Visualizar en el mapa
         map_assignments = plot_assignments_on_map(assignments)
         map_assignments.save("mapa_asignaciones.html")  # Guardar el mapa en un archivo HTML
-        print("\nMapa generado y guardado como 'mapa_asignaciones.html'.")
+        print("")
+        print("Para ver el mapa de asignaciones a grupos, haga click en el siguiente enlace:")
+        print("file://" + os.path.abspath("mapa_asignaciones.html"))
         return True
     else:
         print("No se encontró una asignación válida.")
         return False
 
-def asignaciones_de_paquetes_a_locaciones(packages):
+def asignaciones_de_paquetes_a_locaciones(packages, puntos_files_names):
     # Cargar los puntos de Miraflores desde el JSON
-    with open("puntos_miraflores.json", "r") as f:
-        puntos_miraflores = json.load(f)
+    puntos_miraflores = []
+    for puntos_file_name in puntos_files_names:
+        with open("puntos/" + puntos_file_name, "r") as f:
+            puntos_miraflores.extend(json.load(f))
 
     assignments = []
 
@@ -709,27 +1094,33 @@ def asignaciones_de_paquetes_a_locaciones(packages):
             }
         })
 
-    print("✅ Asignaciones generadas correctamente.")
     map_assignments = plot_assignments_on_map(assignments)
     map_assignments.save("mapa_asignaciones_loc.html")  # Guardar el mapa en un archivo HTML
+    print("")
+    print("Para ver el mapa de asignaciones a locaciones, haga click en el siguiente enlace:")
+    print("file://" + os.path.abspath("mapa_asignaciones_loc.html"))
+
     print("\nMapa generado y guardado como 'mapa_asignaciones_loc.html'.")
 
 # ----- main -----
 
-def main(ver_grafo=False):
+# prop = {
+# array_of_file_json: ["paquetes_miraflores.json", "paquetes_miraflores_2.json"],
+#}
+def main(json_file_names, puntos_files_names):
     # 1. Obtener el grafo de Miraflores
-    print("Obteniendo grafo de Miraflores...")
-    graph = obtener_grafo_miraflores()
-    print("Grafo listo.")
-    print("")
+    #print("Obteniendo grafo de Miraflores...")
+    #graph = obtener_grafo_miraflores()
+    #print("Grafo listo.")
+    #print("")
 
-    if ver_grafo:
-        visualizar_grafo(graph)
-        mostrar_informacion_del_grafo(graph)
+    #if ver_grafo:
+    #    visualizar_grafo(graph)
+    #    mostrar_informacion_del_grafo(graph)
 
     # 2. Importar paquetes
     print("Importando paquetes...")
-    paquetes = obtener_paquetes_con_coordenadas()
+    paquetes = obtener_paquetes_con_coordenadas(json_file_names)
     for p in paquetes:
         if p['lat'] == None or p['lon'] == None:
             print("None para paquete con guia: ", p["numero_guia"])
@@ -737,32 +1128,95 @@ def main(ver_grafo=False):
         if p['lat'] == 0.0 or p['lon'] == 0.0:
             print("0.0 para paquete con guia: ", p["numero_guia"])
             print(p)
+        if p['lat'] == 0 or p['lon'] == 0:
+            print("0 para paquete con guia: ", p["numero_guia"])
+            print(p)
     df_paquetes = pd.DataFrame([p for p in paquetes if p['lat'] != 0.0 and p['lon'] != 0.0])
     print("cantidad de paquetes: ", len(df_paquetes))
-    print("Paquetes importados:")
-    print(df_paquetes.head())
-    print("")
+    #print("Paquetes importados:")
+    #print(df_paquetes.head())
+    #print("")
 
     camiones_disponibles = []
 
-    # 2. Asignar paquetes a camiones
-    print("Asignando paquetes a camiones...")
-    se_asigno = False
-    while se_asigno == False:
-        id_new_camion = f"T{len(camiones_disponibles) + 1}"
+    for i in range(len(paquetes)//100):
+        id_new_camion = f"T{i + 1}"
         new_camion = {'id': id_new_camion, 'max_weight': 900, 'max_volume': 5}
         camiones_disponibles.append(new_camion)
 
+    # 2. Asignar paquetes a camiones
+    print("Buscando asignación óptima de paquetes a camiones...")
+    se_asigno = False
+
+    while se_asigno == False:
         se_asigno = asignaciones_de_paquetes_a_grupos(df_paquetes, camiones_disponibles)
 
         if se_asigno == True:
-            asignaciones_de_paquetes_a_locaciones(df_paquetes)
+            asignaciones_de_paquetes_a_locaciones(df_paquetes, puntos_files_names)
 
         if not se_asigno:
+            id_new_camion = f"T{len(camiones_disponibles) + 1}"
+            new_camion = {'id': id_new_camion, 'max_weight': 900, 'max_volume': 5}
+            camiones_disponibles.append(new_camion)
             print("Intentando de nuevo...")
+
     print("Asignación de paquetes a camiones completada.")
 
 
-
 if __name__ == "__main__":
-    main(ver_grafo=False)
+    start_time = time.time()  # Inicio
+
+    main(json_file_names=[
+        "paquetes_miraflores.json",
+        "paquetes_surquillo.json",
+        "paquetes_santiago_de_surco.json",
+        "paquetes_santa_anita.json",
+        "paquetes_san_miguel.json",
+        "paquetes_san_martin_de_porres.json",
+        "paquetes_san_luis.json",
+        "paquetes_san_isidro.json",
+        "paquetes_san_borja.json",
+        "paquetes_rimac.json",
+        "paquetes_pueblo_libre.json",
+        "paquetes_magdalena_del_mar.json",
+        "paquetes_los_olivos.json",
+        "paquetes_lince.json",
+        "paquetes_la_victoria.json",
+        "paquetes_la_molina.json",
+        "paquetes_jesus_maria.json",
+        "paquetes_independencia.json",
+        "paquetes_el_agustino.json",
+        "paquetes_chorrillos.json",
+        "paquetes_barranco.json",
+        "paquetes_breña.json",
+    ], puntos_files_names=[
+        "puntos_miraflores.json",
+        "puntos_surquillo.json",
+        "puntos_santiago_de_surco.json",
+        "puntos_santa_anita.json",
+        "puntos_san_miguel.json",
+        "puntos_san_martin_de_porres.json",
+        "puntos_san_luis.json",
+        "puntos_san_isidro.json",
+        "puntos_san_borja.json",
+        "puntos_rimac.json",
+        "puntos_pueblo_libre.json",
+        "puntos_magdalena_del_mar.json",
+        "puntos_los_olivos.json",
+        "puntos_lince.json",
+        "puntos_la_victoria.json",
+        "puntos_la_molina.json",
+        "puntos_jesus_maria.json",
+        "puntos_independencia.json",
+        "puntos_el_agustino.json",
+        "puntos_chorrillos.json",
+        "puntos_barranco.json",
+        "puntos_breña.json",
+    ])
+
+    end_time = time.time()  # Fin
+
+    elapsed_time = end_time - start_time
+    print(f"Tiempo de ejecución: {elapsed_time:.2f} segundos ({elapsed_time / 60:.2f} minutos)")
+
+

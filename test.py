@@ -1,16 +1,33 @@
-import osmnx as ox
-import matplotlib.pyplot as plt
+import pandas as pd
 
-# Descargar el grafo de calles de Lima, Perú
-lima_graph = ox.graph_from_place("Lima, Peru", network_type="drive")
+# Load the Excel file
+file_path = "389657_21311_1740606018 (1).xlsx"  # Change to your file path
+df = pd.read_excel(file_path, engine="openpyxl")
 
-# Guardar el grafo en un archivo para reutilizarlo
-ox.save_graphml(lima_graph, "lima_graph.graphml")
+# Show all keys
+#print(df.keys())
 
-# Visualizar el grafo
-ox.plot_graph(lima_graph)
+# Apply multiple filters correctly
+filtered_df = df[
+    (df["FECHA AO"] == "21/02/2025") &
+    (df["FECHA VISITA 1"] == "22/02/2025") &
+    (df["DESTINO"] == "LIM") &
+    (df["LOCALIDAD"] == "MIRAFLORES - LIMA - LIMA")
+    #(df["LOCALIDAD"] == "MIRAFLORES - LIMA - LIMA") &
+    #(df["FECHA AO"] == "21/02/2025") &
+    #(df["FECHA VISITA 1"] == "22/02/2025") &
+    #(df["DESTINO"] == "LIM")
+]
 
-fig, ax = ox.plot_graph(lima_graph, figsize=(10, 10), node_size=5, edge_linewidth=0.5)
-plt.show()
+#find "GUIA" = "WYB317190891"
+print("ENCONtre la guia")
+print(filtered_df[filtered_df["GUIA"] == "WYB317190891"])
 
+# Save the filtered data to a new Excel file
+# filtered_df.to_excel("filtered_data.xlsx", index=False)
 
+# Show first 5 rows
+#print(filtered_df.head())
+
+# Show number of all rows
+#print(filtered_df.shape[0])
