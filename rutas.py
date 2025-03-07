@@ -1139,7 +1139,7 @@ def main(json_file_names, puntos_files_names):
 
     camiones_disponibles = []
 
-    for i in range(len(paquetes)//100):
+    for i in range(len(paquetes)//60):
         id_new_camion = f"T{i + 1}"
         new_camion = {'id': id_new_camion, 'max_weight': 900, 'max_volume': 5}
         camiones_disponibles.append(new_camion)
